@@ -29,7 +29,12 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/touch.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/i2s_std.h"
+#include "es7210_adc.h"
+#include "es8311_codec.h"
 #include "esp_check.h"
+#include "esp_codec_dev_defaults.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
@@ -209,12 +214,85 @@ static void display_pause(bool pause)
     }
 }
 
+#if CONFIG_MUSE_BOARD_WAVESHARE_S3_175
 static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic)
 {
     *spk = bsp_audio_codec_speaker_init();
     *mic = bsp_audio_codec_microphone_init();
     return *spk && *mic ? ESP_OK : ESP_FAIL;
 }
+#else
+/*
+ * The 1.75C's BSP opens the ES7210 at 0x40 and asserts when nothing answers
+ * (BSP_NULL_CHECK). Some units strap it to 0x42 (I2C scan 2026-11-13, ID regs
+ * 0x3D/0x3E = 72 10). So open both codecs here, as the 1.85C board does, and
+ * probe for the ES7210 so a unit at either address works. The ES8311 setup
+ * matches the BSP's.
+ */
+static esp_err_t audio_init(esp_codec_dev_handle_t *spk, esp_codec_dev_handle_t *mic)
+{
+    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "i2c");
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    uint8_t adc_addr = 0;   /* 7-bit */
+    for (uint8_t a = 0x40; a <= 0x43 && !adc_addr; a++) {
+        if (i2c_master_probe(bus, a, 50) == ESP_OK) adc_addr = a;
+    }
+    ESP_RETURN_ON_FALSE(adc_addr, ESP_ERR_NOT_FOUND, TAG, "ES7210 not on I2C (0x40-0x43)");
+    ESP_LOGI(TAG, "ES7210 at 0x%02x", adc_addr);
+
+    i2s_chan_handle_t tx, rx;
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(CONFIG_BSP_I2S_NUM, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx, &rx), TAG, "i2s chan");
+    const i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(22050),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = BSP_I2S_MCLK,
+            .bclk = BSP_I2S_SCLK,
+            .ws = BSP_I2S_LCLK,
+            .dout = BSP_I2S_DOUT,
+            .din = BSP_I2S_DSIN,
+        },
+    };
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(tx, &std_cfg), TAG, "i2s tx");
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx, &std_cfg), TAG, "i2s rx");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(tx), TAG, "i2s tx on");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(rx), TAG, "i2s rx on");
+
+    const audio_codec_data_if_t *data = audio_codec_new_i2s_data(&(audio_codec_i2s_cfg_t){
+        .port = CONFIG_BSP_I2S_NUM, .rx_handle = rx, .tx_handle = tx });
+    ESP_RETURN_ON_FALSE(data, ESP_ERR_NO_MEM, TAG, "i2s data if");
+
+    const audio_codec_ctrl_if_t *spk_ctrl = audio_codec_new_i2c_ctrl(&(audio_codec_i2c_cfg_t){
+        .port = CONFIG_BSP_I2C_NUM, .addr = ES8311_CODEC_DEFAULT_ADDR, .bus_handle = bus });
+    const audio_codec_gpio_if_t *gpio = audio_codec_new_gpio();
+    ESP_RETURN_ON_FALSE(spk_ctrl && gpio, ESP_ERR_NO_MEM, TAG, "spk ctrl");
+    const audio_codec_if_t *spk_codec = es8311_codec_new(&(es8311_codec_cfg_t){
+        .ctrl_if = spk_ctrl,
+        .gpio_if = gpio,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin = BSP_POWER_AMP_IO,
+        .use_mclk = true,
+        .hw_gain = { .pa_voltage = 5.0, .codec_dac_voltage = 3.3 },
+    });
+    ESP_RETURN_ON_FALSE(spk_codec, ESP_FAIL, TAG, "ES8311 not responding");
+    *spk = esp_codec_dev_new(&(esp_codec_dev_cfg_t){
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT, .codec_if = spk_codec, .data_if = data });
+    ESP_RETURN_ON_FALSE(*spk, ESP_FAIL, TAG, "spk dev");
+
+    /* audio_codec_new_i2c_ctrl takes the 8-bit address. */
+    const audio_codec_ctrl_if_t *mic_ctrl = audio_codec_new_i2c_ctrl(&(audio_codec_i2c_cfg_t){
+        .port = CONFIG_BSP_I2C_NUM, .addr = (uint8_t)(adc_addr << 1), .bus_handle = bus });
+    ESP_RETURN_ON_FALSE(mic_ctrl, ESP_ERR_NO_MEM, TAG, "mic ctrl");
+    const audio_codec_if_t *mic_codec = es7210_codec_new(&(es7210_codec_cfg_t){ .ctrl_if = mic_ctrl });
+    ESP_RETURN_ON_FALSE(mic_codec, ESP_FAIL, TAG, "ES7210 not responding");
+    *mic = esp_codec_dev_new(&(esp_codec_dev_cfg_t){
+        .dev_type = ESP_CODEC_DEV_TYPE_IN, .codec_if = mic_codec, .data_if = data });
+    ESP_RETURN_ON_FALSE(*mic, ESP_FAIL, TAG, "mic dev");
+    return ESP_OK;
+}
+#endif
 
 static void set_mic_gain(esp_codec_dev_handle_t mic, int db)
 {
